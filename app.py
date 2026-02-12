@@ -20,6 +20,9 @@ from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
+from fastapi import Response
+import time
+
 
 from sqlalchemy import (
     create_engine,
@@ -1156,3 +1159,21 @@ def download_combined():
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@app.get("/healthz")
+def healthz(response: Response):
+    t0 = time.perf_counter()
+    try:
+        conn = db_connect()
+        try:
+            conn.execute("SELECT 1;")
+            # Optional: verify the tables exist
+            conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='customers';")
+        finally:
+            conn.close()
+        ms = int((time.perf_counter() - t0) * 1000)
+        return {"ok": True, "db": "ok", "latency_ms": ms, "utc": utc_now_iso()}
+    except Exception as e:
+        response.status_code = 503
+        return {"ok": False, "db": "fail", "error": str(e), "utc": utc_now_iso()}

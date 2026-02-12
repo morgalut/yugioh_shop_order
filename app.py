@@ -1165,15 +1165,22 @@ def download_combined():
 def healthz(response: Response):
     t0 = time.perf_counter()
     try:
-        conn = db_connect()
-        try:
-            conn.execute("SELECT 1;")
-            # Optional: verify the tables exist
-            conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='customers';")
-        finally:
-            conn.close()
+        with ENGINE.begin() as conn:
+            conn.execute(sql_text("SELECT 1"))
+
         ms = int((time.perf_counter() - t0) * 1000)
-        return {"ok": True, "db": "ok", "latency_ms": ms, "utc": utc_now_iso()}
+        return {
+            "ok": True,
+            "db": "ok",
+            "latency_ms": ms,
+            "utc": utc_now_iso()
+        }
+
     except Exception as e:
         response.status_code = 503
-        return {"ok": False, "db": "fail", "error": str(e), "utc": utc_now_iso()}
+        return {
+            "ok": False,
+            "db": "fail",
+            "error": str(e),
+            "utc": utc_now_iso()
+        }

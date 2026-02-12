@@ -666,11 +666,111 @@ def page_layout(body: str) -> str:
     .sectionTitle {{ display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; }}
     .small {{ font-size: 12px; }}
     .tight td {{ padding: 6px; }}
+
+    /* Ping status badge */
+    .pingBadge {{
+      position: fixed;
+      right: 14px;
+      bottom: 14px;
+      z-index: 9999;
+      border: 1px solid #ddd;
+      background: #fff;
+      border-radius: 999px;
+      padding: 8px 12px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+      font-size: 12px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }}
+    .dot {{
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #bbb;
+      display: inline-block;
+    }}
+    .dot.ok {{ background: #2ecc71; }}
+    .dot.bad {{ background: #e74c3c; }}
+    .pingError {{
+      position: fixed;
+      left: 18px;
+      right: 18px;
+      bottom: 56px;
+      z-index: 9998;
+      display: none;
+    }}
   </style>
 </head>
 <body>
+
+<div id="pingError" class="warn pingError">
+  <b>Server connection problem.</b>
+  <span class="muted">Refreshing may help. If this continues, the server may be down.</span>
+</div>
+
+<div class="pingBadge" title="Auto ping every 2 minutes">
+  <span id="pingDot" class="dot"></span>
+  <span id="pingText" class="muted">Checking server…</span>
+</div>
+
 {body}
+
+<script>
+(function() {{
+  const dot = document.getElementById("pingDot");
+  const text = document.getElementById("pingText");
+  const err = document.getElementById("pingError");
+
+  function setOk(msg) {{
+    dot.classList.remove("bad");
+    dot.classList.add("ok");
+    text.textContent = msg;
+    err.style.display = "none";
+  }}
+
+  function setBad(msg) {{
+    dot.classList.remove("ok");
+    dot.classList.add("bad");
+    text.textContent = msg;
+    err.style.display = "block";
+  }}
+
+  async function doPing() {{
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 4000); // 4s timeout
+
+    try {{
+      const res = await fetch("/ping", {{
+        cache: "no-store",
+        signal: controller.signal
+      }});
+      clearTimeout(t);
+
+      if (!res.ok) {{
+        setBad("Ping failed (HTTP " + res.status + ")");
+        return;
+      }}
+      const data = await res.json();
+      if (data && data.ok) {{
+        setOk("Server OK");
+      }} else {{
+        setBad("Ping failed (bad response)");
+      }}
+    }} catch (e) {{
+      clearTimeout(t);
+      setBad("Server not reachable");
+    }}
+  }}
+
+  // First ping immediately, then every 2 minutes
+  doPing();
+  setInterval(doPing, 120000);
+}})();
+</script>
+
 </body></html>"""
+
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1010,3 +1110,7 @@ def download_combined():
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+@app.get("/ping")
+def ping():
+    return {"ok": True, "utc": utc_now_iso()}

@@ -1,29 +1,19 @@
 # app.py
 # Run:
-#   pip install fastapi uvicorn openpyxl
+#   pip install fastapi uvicorn openpyxl sqlalchemy psycopg[binary]
 #   uvicorn app:app --reload
 # Open:
 #   http://127.0.0.1:8000
-#
-# What’s new in this version:
-# ✅ Customers saved in SQLite (unique names).
-# ✅ Orders + order lines saved in SQLite (basket persists across server restarts).
-# ✅ Basket shows each user separately (grouped).
-# ✅ Add / Remove / Edit products (order lines) directly in the basket.
-# ✅ Download Excel per user OR combined Excel (from DB).
-#
-# Notes:
-# - “Basket” == all orders with status='OPEN'
-# - Download does NOT clear basket (you can clear manually).
 
 from __future__ import annotations
 
 import io
+import os
 import re
-import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Tuple
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Form, Query
 from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
@@ -31,171 +21,262 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
 
-app = FastAPI()
-DB_PATH = "customers.db"
+from sqlalchemy import (
+    create_engine,
+    event,
+    MetaData,
+    Table,
+    Column,
+    Integer,
+    String,
+    ForeignKey,
+    Text,
+    select,
+    insert,
+    update,
+    delete,
+    text as sql_text,
+)
+from sqlalchemy.engine import Engine
+
 
 # ----------------------------
-# SQLite helpers
+# Render-friendly database config
 # ----------------------------
-def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON;")
-    return conn
+def _normalize_database_url(url: str) -> str:
+    """
+    Render/Heroku sometimes use 'postgres://'. SQLAlchemy expects 'postgresql://'.
+    """
+    url = (url or "").strip()
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://") :]
+    return url
+
+
+def _default_sqlite_path() -> str:
+    """
+    Render Persistent Disk docs recommend mounting e.g. /var/data.
+    Only filesystem changes under the disk mount path persist. :contentReference[oaicite:5]{index=5}
+    """
+    # If you mount a disk at /var/data, keep SQLite there.
+    # Locally (no disk), this still works if /var/data exists; otherwise we fall back.
+    return os.getenv("DB_PATH", "/var/data/customers.db")
+
+
+def make_engine() -> Engine:
+    db_url = os.getenv("DATABASE_URL", "").strip()
+    if db_url:
+        db_url = _normalize_database_url(db_url)
+        # Prefer psycopg (modern). If user provides plain postgresql:// it still works.
+        if db_url.startswith("postgresql://"):
+            db_url = db_url.replace("postgresql://", "postgresql+psycopg://", 1)
+        engine = create_engine(db_url, pool_pre_ping=True)
+        return engine
+
+    # Fallback: SQLite (best only with Persistent Disk on Render)
+    sqlite_path = _default_sqlite_path()
+    sqlite_dir = os.path.dirname(sqlite_path)
+    if sqlite_dir and not os.path.exists(sqlite_dir):
+        # If running locally and /var/data doesn't exist, fall back to project file.
+        # (On Render with a mounted disk, /var/data exists.)
+        sqlite_path = "customers.db"
+    else:
+        # Ensure directory exists if it is a real path
+        if sqlite_dir:
+            os.makedirs(sqlite_dir, exist_ok=True)
+
+    engine = create_engine(
+        f"sqlite:///{sqlite_path}",
+        connect_args={"check_same_thread": False},
+        pool_pre_ping=True,
+    )
+    return engine
+
+
+ENGINE = make_engine()
+META = MetaData()
+
+# Enable foreign keys on SQLite
+@event.listens_for(ENGINE, "connect")
+def _set_sqlite_pragma(dbapi_connection, connection_record):
+    try:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys = ON;")
+        cursor.close()
+    except Exception:
+        # Not SQLite or cannot set pragma
+        pass
+
+
+# ----------------------------
+# Schema (works on SQLite + Postgres)
+# ----------------------------
+customers = Table(
+    "customers",
+    META,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("name", String, nullable=False, unique=True),
+    Column("created_at_utc", String, nullable=False),
+)
+
+orders = Table(
+    "orders",
+    META,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("customer_id", Integer, ForeignKey("customers.id", ondelete="CASCADE"), nullable=False),
+    Column("pasted_text", Text, nullable=False),
+    Column("global_note", Text, nullable=True),
+    Column("status", String, nullable=False, server_default="OPEN"),  # OPEN / ARCHIVED
+    Column("created_at_utc", String, nullable=False),
+)
+
+order_lines = Table(
+    "order_lines",
+    META,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("order_id", Integer, ForeignKey("orders.id", ondelete="CASCADE"), nullable=False),
+    Column("card_name", String, nullable=False),
+    Column("qty", Integer, nullable=False),
+    Column("display_item", String, nullable=False),
+    Column("rarity", String, nullable=True),
+    Column("notes", Text, nullable=True),
+    Column("raw_line", Text, nullable=True),
+    Column("created_at_utc", String, nullable=False),
+)
 
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def init_db() -> None:
-    conn = db_connect()
-    try:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS customers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
-                created_at_utc TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                customer_id INTEGER NOT NULL,
-                pasted_text TEXT NOT NULL,
-                global_note TEXT,
-                status TEXT NOT NULL DEFAULT 'OPEN', -- OPEN / ARCHIVED
-                created_at_utc TEXT NOT NULL,
-                FOREIGN KEY(customer_id) REFERENCES customers(id) ON DELETE CASCADE
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_orders_customer_status
-            ON orders(customer_id, status);
-
-            CREATE TABLE IF NOT EXISTS order_lines (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_id INTEGER NOT NULL,
-                card_name TEXT NOT NULL,
-                qty INTEGER NOT NULL,
-                display_item TEXT NOT NULL,
-                rarity TEXT,
-                notes TEXT,
-                raw_line TEXT,
-                created_at_utc TEXT NOT NULL,
-                FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_lines_order
-            ON order_lines(order_id);
-            """
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-@app.on_event("startup")
-def _startup():
-    init_db()
-
-
 def _collapse_spaces(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip()
+    return re.sub(r"\s+", " ", (s or "")).strip()
 
 
-# --- customers ---
-def get_customer_by_exact_name(name: str) -> Optional[sqlite3.Row]:
-    name = _collapse_spaces(name)
-    conn = db_connect()
+def init_db() -> None:
+    META.create_all(ENGINE)
+    # Helpful indexes (idempotent: create if not exists is DB-specific; we’ll do best-effort)
+    with ENGINE.begin() as conn:
+        # SQLite supports IF NOT EXISTS; Postgres supports IF NOT EXISTS as well for CREATE INDEX.
+        conn.execute(sql_text("CREATE INDEX IF NOT EXISTS idx_orders_customer_status ON orders(customer_id, status)"))
+        conn.execute(sql_text("CREATE INDEX IF NOT EXISTS idx_lines_order ON order_lines(order_id)"))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+# ----------------------------
+# Health endpoint for Render + your UI pings
+# ----------------------------
+@app.get("/ping")
+def ping():
+    # Basic DB check too (useful on Render health checks)
     try:
-        cur = conn.execute("SELECT id, name FROM customers WHERE name = ?", (name,))
-        return cur.fetchone()
-    finally:
-        conn.close()
+        with ENGINE.begin() as conn:
+            conn.execute(sql_text("SELECT 1"))
+        return {"ok": True, "utc": utc_now_iso()}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "utc": utc_now_iso()}
 
 
-def create_customer(name: str) -> Tuple[bool, Optional[sqlite3.Row], str]:
+# ----------------------------
+# Customers
+# ----------------------------
+def get_customer_by_exact_name(name: str) -> Optional[Dict]:
+    name = _collapse_spaces(name)
+    if not name:
+        return None
+    with ENGINE.begin() as conn:
+        row = conn.execute(
+            select(customers.c.id, customers.c.name).where(customers.c.name == name)
+        ).mappings().first()
+        return dict(row) if row else None
+
+
+def create_customer(name: str) -> Tuple[bool, Optional[Dict], str]:
     name = _collapse_spaces(name)
     if not name:
         return (False, None, "Empty name.")
-    conn = db_connect()
-    try:
+
+    with ENGINE.begin() as conn:
         try:
-            conn.execute(
-                "INSERT INTO customers (name, created_at_utc) VALUES (?, ?)",
-                (name, utc_now_iso()),
+            res = conn.execute(
+                insert(customers).values(name=name, created_at_utc=utc_now_iso())
             )
-            conn.commit()
-            row = get_customer_by_exact_name(name)
-            return (True, row, f'Created "{name}".')
-        except sqlite3.IntegrityError:
+            # Fetch inserted row
+            row = conn.execute(
+                select(customers.c.id, customers.c.name).where(customers.c.id == res.inserted_primary_key[0])
+            ).mappings().first()
+            return (True, dict(row), f'Created "{name}".')
+        except Exception:
+            # Most likely UNIQUE constraint
             row = get_customer_by_exact_name(name)
             return (False, row, f'"{name}" already exists.')
-    finally:
-        conn.close()
 
 
-def search_customers(q: str, limit: int = 20) -> List[sqlite3.Row]:
+def search_customers(q: str, limit: int = 20) -> List[Dict]:
     q = _collapse_spaces(q)
-    conn = db_connect()
-    try:
+    with ENGINE.begin() as conn:
         if not q:
-            cur = conn.execute("SELECT id, name FROM customers ORDER BY name ASC LIMIT ?", (limit,))
-            return cur.fetchall()
+            rows = conn.execute(
+                select(customers.c.id, customers.c.name).order_by(customers.c.name.asc()).limit(limit)
+            ).mappings().all()
+            return [dict(r) for r in rows]
+
         like = f"%{q}%"
-        cur = conn.execute(
-            "SELECT id, name FROM customers WHERE name LIKE ? ORDER BY name ASC LIMIT ?",
-            (like, limit),
-        )
-        return cur.fetchall()
-    finally:
-        conn.close()
+        rows = conn.execute(
+            select(customers.c.id, customers.c.name)
+            .where(customers.c.name.like(like))
+            .order_by(customers.c.name.asc())
+            .limit(limit)
+        ).mappings().all()
+        return [dict(r) for r in rows]
 
 
-# --- orders & lines ---
+# ----------------------------
+# Orders & lines
+# ----------------------------
 def create_order(customer_id: int, pasted_text: str, global_note: Optional[str]) -> int:
-    conn = db_connect()
-    try:
-        cur = conn.execute(
-            """
-            INSERT INTO orders (customer_id, pasted_text, global_note, status, created_at_utc)
-            VALUES (?, ?, ?, 'OPEN', ?)
-            """,
-            (customer_id, pasted_text, global_note, utc_now_iso()),
+    with ENGINE.begin() as conn:
+        res = conn.execute(
+            insert(orders).values(
+                customer_id=int(customer_id),
+                pasted_text=pasted_text,
+                global_note=global_note,
+                status="OPEN",
+                created_at_utc=utc_now_iso(),
+            )
         )
-        conn.commit()
-        return int(cur.lastrowid)
-    finally:
-        conn.close()
+        return int(res.inserted_primary_key[0])
 
 
 def add_lines(order_id: int, lines: List["ParsedLine"]) -> None:
-    conn = db_connect()
-    try:
-        now = utc_now_iso()
-        conn.executemany(
-            """
-            INSERT INTO order_lines
-            (order_id, card_name, qty, display_item, rarity, notes, raw_line, created_at_utc)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    order_id,
-                    ln.card_name_raw,
-                    int(ln.quantity),
-                    ln.display_item,
-                    ln.rarity or "",
-                    ln.notes or "",
-                    ln.raw_line,
-                    now,
-                )
-                for ln in lines
-            ],
+    now = utc_now_iso()
+    payload = []
+    for ln in lines:
+        payload.append(
+            dict(
+                order_id=int(order_id),
+                card_name=ln.card_name_raw,
+                qty=int(ln.quantity),
+                display_item=ln.display_item,
+                rarity=(ln.rarity or ""),
+                notes=(ln.notes or ""),
+                raw_line=ln.raw_line,
+                created_at_utc=now,
+            )
         )
-        conn.commit()
-    finally:
-        conn.close()
+    if not payload:
+        return
+
+    with ENGINE.begin() as conn:
+        conn.execute(insert(order_lines), payload)
 
 
 def get_open_basket_grouped() -> List[Dict]:
@@ -207,83 +288,74 @@ def get_open_basket_grouped() -> List[Dict]:
         lines:  [{line_id, order_id, card_name, qty, display_item, rarity, notes, raw_line}]
       }
     """
-    conn = db_connect()
-    try:
-        # customers with any OPEN orders
-        customers = conn.execute(
-            """
-            SELECT DISTINCT c.id AS customer_id, c.name AS customer_name
-            FROM customers c
-            JOIN orders o ON o.customer_id = c.id
-            WHERE o.status = 'OPEN'
-            ORDER BY c.name ASC
-            """
-        ).fetchall()
+    with ENGINE.begin() as conn:
+        customer_rows = conn.execute(
+            sql_text(
+                """
+                SELECT DISTINCT c.id AS customer_id, c.name AS customer_name
+                FROM customers c
+                JOIN orders o ON o.customer_id = c.id
+                WHERE o.status = 'OPEN'
+                ORDER BY c.name ASC
+                """
+            )
+        ).mappings().all()
 
         result: List[Dict] = []
-        for c in customers:
+        for c in customer_rows:
             cid = int(c["customer_id"])
-            orders = conn.execute(
-                """
-                SELECT id AS order_id, created_at_utc, global_note, pasted_text
-                FROM orders
-                WHERE customer_id = ? AND status = 'OPEN'
-                ORDER BY id DESC
-                """,
-                (cid,),
-            ).fetchall()
+            orders_rows = conn.execute(
+                sql_text(
+                    """
+                    SELECT id AS order_id, created_at_utc, global_note, pasted_text
+                    FROM orders
+                    WHERE customer_id = :cid AND status = 'OPEN'
+                    ORDER BY id DESC
+                    """
+                ),
+                {"cid": cid},
+            ).mappings().all()
 
-            order_ids = [int(o["order_id"]) for o in orders]
-            lines: List[sqlite3.Row] = []
+            order_ids = [int(o["order_id"]) for o in orders_rows]
+            lines_rows: List[Dict] = []
             if order_ids:
-                placeholders = ",".join(["?"] * len(order_ids))
-                lines = conn.execute(
-                    f"""
-                    SELECT
-                      l.id AS line_id,
-                      l.order_id,
-                      l.card_name,
-                      l.qty,
-                      l.display_item,
-                      l.rarity,
-                      l.notes,
-                      l.raw_line
-                    FROM order_lines l
-                    WHERE l.order_id IN ({placeholders})
-                    ORDER BY l.id ASC
-                    """,
-                    tuple(order_ids),
-                ).fetchall()
+                # SQLAlchemy expanding params works nicely
+                lines_rows = conn.execute(
+                    select(
+                        order_lines.c.id.label("line_id"),
+                        order_lines.c.order_id,
+                        order_lines.c.card_name,
+                        order_lines.c.qty,
+                        order_lines.c.display_item,
+                        order_lines.c.rarity,
+                        order_lines.c.notes,
+                        order_lines.c.raw_line,
+                    )
+                    .where(order_lines.c.order_id.in_(order_ids))
+                    .order_by(order_lines.c.id.asc())
+                ).mappings().all()
 
             result.append(
                 {
                     "customer_id": cid,
                     "customer_name": str(c["customer_name"]),
-                    "orders": [dict(o) for o in orders],
-                    "lines": [dict(l) for l in lines],
+                    "orders": [dict(o) for o in orders_rows],
+                    "lines": [dict(l) for l in lines_rows],
                 }
             )
         return result
-    finally:
-        conn.close()
 
 
 def delete_open_orders_for_customer(customer_id: int) -> None:
-    conn = db_connect()
-    try:
-        conn.execute("DELETE FROM orders WHERE customer_id = ? AND status = 'OPEN'", (customer_id,))
-        conn.commit()
-    finally:
-        conn.close()
+    with ENGINE.begin() as conn:
+        conn.execute(
+            delete(orders).where(orders.c.customer_id == int(customer_id), orders.c.status == "OPEN")
+        )
 
 
 def clear_basket() -> None:
-    conn = db_connect()
-    try:
-        conn.execute("DELETE FROM orders WHERE status = 'OPEN'")
-        conn.commit()
-    finally:
-        conn.close()
+    with ENGINE.begin() as conn:
+        conn.execute(delete(orders).where(orders.c.status == "OPEN"))
 
 
 def update_line(line_id: int, card_name: str, qty: int, rarity: str, notes: str) -> None:
@@ -291,113 +363,93 @@ def update_line(line_id: int, card_name: str, qty: int, rarity: str, notes: str)
     if qty < 1:
         qty = 1
     display_item = f"{card_name} {qty}"
-    conn = db_connect()
-    try:
+    with ENGINE.begin() as conn:
         conn.execute(
-            """
-            UPDATE order_lines
-            SET card_name = ?, qty = ?, display_item = ?, rarity = ?, notes = ?
-            WHERE id = ?
-            """,
-            (card_name, int(qty), display_item, rarity or "", notes or "", int(line_id)),
+            update(order_lines)
+            .where(order_lines.c.id == int(line_id))
+            .values(
+                card_name=card_name,
+                qty=int(qty),
+                display_item=display_item,
+                rarity=(rarity or ""),
+                notes=(notes or ""),
+            )
         )
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def delete_line(line_id: int) -> None:
-    conn = db_connect()
-    try:
-        conn.execute("DELETE FROM order_lines WHERE id = ?", (int(line_id),))
-        conn.commit()
-    finally:
-        conn.close()
+    with ENGINE.begin() as conn:
+        conn.execute(delete(order_lines).where(order_lines.c.id == int(line_id)))
 
 
 def add_manual_line_to_customer_open(customer_id: int, card_name: str, qty: int, rarity: str, notes: str) -> None:
-    """
-    Adds a line under a new OPEN order for that customer (so it belongs to basket).
-    """
     card_name = _collapse_spaces(card_name)
     if not card_name:
         return
     if qty < 1:
         qty = 1
 
-    order_id = create_order(customer_id, pasted_text="(manual)", global_note=None)
-
+    oid = create_order(int(customer_id), pasted_text="(manual)", global_note=None)
     display_item = f"{card_name} {qty}"
-    conn = db_connect()
-    try:
+
+    with ENGINE.begin() as conn:
         conn.execute(
-            """
-            INSERT INTO order_lines
-            (order_id, card_name, qty, display_item, rarity, notes, raw_line, created_at_utc)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                order_id,
-                card_name,
-                int(qty),
-                display_item,
-                rarity or "",
-                notes or "",
-                "(manual)",
-                utc_now_iso(),
-            ),
+            insert(order_lines).values(
+                order_id=int(oid),
+                card_name=card_name,
+                qty=int(qty),
+                display_item=display_item,
+                rarity=(rarity or ""),
+                notes=(notes or ""),
+                raw_line="(manual)",
+                created_at_utc=utc_now_iso(),
+            )
         )
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def get_customer_open_orders_and_lines(customer_id: int) -> Tuple[str, List[Dict], List[Dict]]:
-    conn = db_connect()
-    try:
-        c = conn.execute("SELECT id, name FROM customers WHERE id = ?", (int(customer_id),)).fetchone()
+    with ENGINE.begin() as conn:
+        c = conn.execute(
+            select(customers.c.id, customers.c.name).where(customers.c.id == int(customer_id))
+        ).mappings().first()
         if not c:
             raise ValueError("Customer not found.")
 
-        orders = conn.execute(
-            """
-            SELECT id AS order_id, created_at_utc, global_note, pasted_text
-            FROM orders
-            WHERE customer_id = ? AND status = 'OPEN'
-            ORDER BY id DESC
-            """,
-            (int(customer_id),),
-        ).fetchall()
-        order_ids = [int(o["order_id"]) for o in orders]
+        orders_rows = conn.execute(
+            sql_text(
+                """
+                SELECT id AS order_id, created_at_utc, global_note, pasted_text
+                FROM orders
+                WHERE customer_id = :cid AND status = 'OPEN'
+                ORDER BY id DESC
+                """
+            ),
+            {"cid": int(customer_id)},
+        ).mappings().all()
 
-        lines: List[sqlite3.Row] = []
+        order_ids = [int(o["order_id"]) for o in orders_rows]
+        lines_rows: List[Dict] = []
         if order_ids:
-            placeholders = ",".join(["?"] * len(order_ids))
-            lines = conn.execute(
-                f"""
-                SELECT
-                  l.id AS line_id,
-                  l.order_id,
-                  l.card_name,
-                  l.qty,
-                  l.display_item,
-                  l.rarity,
-                  l.notes,
-                  l.raw_line
-                FROM order_lines l
-                WHERE l.order_id IN ({placeholders})
-                ORDER BY l.id ASC
-                """,
-                tuple(order_ids),
-            ).fetchall()
+            lines_rows = conn.execute(
+                select(
+                    order_lines.c.id.label("line_id"),
+                    order_lines.c.order_id,
+                    order_lines.c.card_name,
+                    order_lines.c.qty,
+                    order_lines.c.display_item,
+                    order_lines.c.rarity,
+                    order_lines.c.notes,
+                    order_lines.c.raw_line,
+                )
+                .where(order_lines.c.order_id.in_(order_ids))
+                .order_by(order_lines.c.id.asc())
+            ).mappings().all()
 
-        return (str(c["name"]), [dict(o) for o in orders], [dict(l) for l in lines])
-    finally:
-        conn.close()
+        return (str(c["name"]), [dict(o) for o in orders_rows], [dict(l) for l in lines_rows])
 
 
 # ----------------------------
-# Parsing (Hebrew + mixed English)
+# Parsing (Hebrew + mixed English)  (UNCHANGED)
 # ----------------------------
 RARITY_WORDS = re.compile(r"\b(Rare|Secret|Ultra|Super|Platinum|Common|SR|UR|SCR|CR)\b", re.IGNORECASE)
 HEBREW_NOTE_KEYWORDS = ["קומון", "קומונים", "פלייסט", "פלייסטים", "גרסה", "לא אכפת", "לא משנה"]
@@ -517,7 +569,7 @@ def parse_order(text: str) -> Tuple[Optional[str], List[ParsedLine]]:
 
 
 # ----------------------------
-# Excel generation
+# Excel generation (UNCHANGED)
 # ----------------------------
 def style_sheet(ws, col_widths: Dict[int, float]):
     ws.freeze_panes = "A2"
@@ -540,16 +592,15 @@ def style_sheet(ws, col_widths: Dict[int, float]):
             cell.alignment = top_wrap if cell.column in wrap_cols else top_nowrap
 
 
-def build_excel_from_lines(customer_name: str, customer_id: int, lines: List[Dict], orders: List[Dict]) -> bytes:
+def build_excel_from_lines(customer_name: str, customer_id: int, lines: List[Dict], orders_: List[Dict]) -> bytes:
     wb = Workbook()
     ws = wb.active
     ws.title = "OrderLines"
     headers = ["CustomerName", "CustomerID", "CardName", "Qty", "DisplayItem", "Rarity", "Notes", "RawLine"]
     ws.append(headers)
 
-    # Map global_note by order_id for better notes composition (if needed)
     order_note: Dict[int, str] = {}
-    for o in orders:
+    for o in orders_:
         oid = int(o["order_id"])
         gn = (o.get("global_note") or "").strip()
         order_note[oid] = gn
@@ -640,7 +691,7 @@ def build_excel_combined_from_db(groups: List[Dict]) -> bytes:
 
 
 # ----------------------------
-# HTML
+# HTML (your existing UI + ping badge)
 # ----------------------------
 def page_layout(body: str) -> str:
     return f"""<!doctype html>
@@ -667,7 +718,6 @@ def page_layout(body: str) -> str:
     .small {{ font-size: 12px; }}
     .tight td {{ padding: 6px; }}
 
-    /* Ping status badge */
     .pingBadge {{
       position: fixed;
       right: 14px;
@@ -738,7 +788,7 @@ def page_layout(body: str) -> str:
 
   async function doPing() {{
     const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), 4000); // 4s timeout
+    const t = setTimeout(() => controller.abort(), 4000);
 
     try {{
       const res = await fetch("/ping", {{
@@ -755,7 +805,7 @@ def page_layout(body: str) -> str:
       if (data && data.ok) {{
         setOk("Server OK");
       }} else {{
-        setBad("Ping failed (bad response)");
+        setBad("DB/Ping failed");
       }}
     }} catch (e) {{
       clearTimeout(t);
@@ -763,7 +813,6 @@ def page_layout(body: str) -> str:
     }}
   }}
 
-  // First ping immediately, then every 2 minutes
   doPing();
   setInterval(doPing, 120000);
 }})();
@@ -772,7 +821,9 @@ def page_layout(body: str) -> str:
 </body></html>"""
 
 
-
+# ----------------------------
+# Routes (mostly unchanged)
+# ----------------------------
 @app.get("/", response_class=HTMLResponse)
 def home(q: str = Query("", description="search customers")):
     results = search_customers(q, limit=15)
@@ -799,7 +850,6 @@ def home(q: str = Query("", description="search customers")):
 
 <div class="card">
   <form method="post" action="/add_to_basket">
-    <!-- Row 1: username -->
     <div class="row">
       <label><b>Recipient name (exact)</b></label>
       <input type="text" name="recipient_name" placeholder="e.g. Name Customer" required />
@@ -808,7 +858,6 @@ def home(q: str = Query("", description="search customers")):
       <span class="muted">Use Create only if this exact name is new.</span>
     </div>
 
-    <!-- Row 2: cards -->
     <div style="margin-top:10px;">
       <label><b>Cards (paste WhatsApp text)</b></label>
       <textarea name="order_text" placeholder="Paste the order here..." required></textarea>
@@ -878,7 +927,6 @@ def add_to_basket(
 """
         return page_layout(body)
 
-    # action == add
     row = get_customer_by_exact_name(recipient_name)
     if not row:
         body = f"""
@@ -917,7 +965,6 @@ def basket():
         cid = g["customer_id"]
         cname = g["customer_name"]
 
-        # Build table rows with inline edit forms
         rows_html = ""
         for l in g["lines"]:
             line_id = int(l["line_id"])
@@ -952,7 +999,6 @@ def basket():
 </tr>
 """
 
-        # Add manual line row
         add_row = f"""
 <tr>
   <td class="small muted">+</td>
@@ -1078,12 +1124,12 @@ def clear_basket_route():
 @app.post("/download_user")
 def download_user(customer_id: int = Form(...)):
     cid = int(customer_id)
-    cname, orders, lines = get_customer_open_orders_and_lines(cid)
+    cname, orders_, lines = get_customer_open_orders_and_lines(cid)
 
     if not lines:
         return RedirectResponse("/basket", status_code=303)
 
-    data = build_excel_from_lines(cname, cid, lines, orders)
+    data = build_excel_from_lines(cname, cid, lines, orders_)
     today = datetime.now().date().isoformat()
     safe_name = _collapse_spaces(cname).replace("/", "-").replace("\\", "-")
     filename = f"{today} - {safe_name}.xlsx"
@@ -1110,7 +1156,3 @@ def download_combined():
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
-
-@app.get("/ping")
-def ping():
-    return {"ok": True, "utc": utc_now_iso()}

@@ -1,28 +1,85 @@
-# docker-compose.yml
 version: "3.9"
 
 services:
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: yugioh_app
+
+  db:
+    image: postgres:15
+    container_name: yugioh_db
+    restart: unless-stopped
     environment:
-      - DB_PATH=/data/customers.db
+      POSTGRES_USER: yugioh
+      POSTGRES_PASSWORD: yugiohpass
+      POSTGRES_DB: yugiohdb
     volumes:
-      - ./data:/data
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U yugioh -d yugiohdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    stop_grace_period: 30s
+
+  web:
+    build: .
+    container_name: yugioh_app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://yugioh:yugiohpass@db:5432/yugiohdb
+      PORT: "8000"
     expose:
       - "8000"
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz').read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    stop_grace_period: 20s
+
+  pinger:
+    image: curlimages/curl:latest
+    container_name: yugioh_pinger
     restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy
+    networks:
+      - internal
+    entrypoint: >
+      sh -c "
+      while true; do
+        ts=$$(date -Iseconds);
+        code=$$(curl -s -o /dev/null -w '%{http_code}' http://web:8000/healthz);
+        echo \"[$$ts] healthz => HTTP $$code\";
+        sleep 300;
+      done
+      "
+
+
 
   nginx:
     image: nginx:latest
     container_name: yugioh_nginx
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy
     ports:
       - "80:80"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./logs:/var/log/nginx
-    depends_on:
-      - app
-    restart: unless-stopped
+    networks:
+      - internal
+
+networks:
+  internal:
+
+volumes:
+  postgres_data:
